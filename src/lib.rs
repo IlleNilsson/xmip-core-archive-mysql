@@ -4,6 +4,9 @@
 //! retained item as one row of an archive table, and restores it by
 //! selecting the row back.
 //!
+//! The metadata text, the timestamp, the layout and the checksum come
+//! from the archive capability (ADR-0044); only the dialect is this crate's.
+//!
 //! A xmip-core-archive **technology** (repository-model.md): it depends on
 //! the archive capability for the [`ArchiveStore`] trait and its item,
 //! receipt and error types, and on the `MySQL` transport technology for
@@ -31,7 +34,6 @@
 //! own connection.
 
 pub mod row;
-pub mod timestamp;
 
 use std::time::{Duration, SystemTime};
 
@@ -106,7 +108,7 @@ impl MysqlArchive {
 
 impl ArchiveStore for MysqlArchive {
     fn archive(&self, item: ArchiveItem) -> Result<ArchiveReceipt, ArchiveError> {
-        let archived_at = timestamp::datetime_utc(SystemTime::now());
+        let archived_at = archive::timestamp::datetime_utc(SystemTime::now());
         let sql = row::insert_sql(&self.table, &item, &archived_at);
         let mut client = self.connect()?;
         client.execute(&sql).map_err(error)?;
@@ -200,7 +202,7 @@ mod tests {
             Some(held.data_type.clone()),
             Some(held.identifier.clone()),
             Some(hex::hex_literal(&held.bytes)),
-            Some(row::encode_metadata(&held.metadata)),
+            Some(archive::metadata::encode(&held.metadata)),
         ];
         let handle = std::thread::spawn(move || {
             let mut events = Vec::new();
