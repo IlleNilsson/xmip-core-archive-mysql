@@ -1,21 +1,20 @@
 #![forbid(unsafe_code)]
 
-//! `MySQL` and `MariaDB` archive: an [`ArchiveStore`] that keeps each
-//! retained item as one row of an archive table, and restores it by
-//! selecting the row back.
+//! `MySQL` and `MariaDB` archive: the [`Dialect`] the archive capability's
+//! `SqlArchive` keeps each retained item in an archive table with, as
+//! `SqlArchive::<MySql>`.
 //!
-//! The metadata text, the timestamp, the shared row code and the receipt
-//! parser come from the archive capability (ADR-0044); only the dialect is
-//! this crate's.
-//!
-//! A xmip-core-archive **technology** (repository-model.md): it depends on
-//! the archive capability for the [`ArchiveStore`] trait and its item,
-//! receipt and error types, and on the `MySQL` transport technology for
-//! the connection — the text protocol with the native password. One item
-//! is one row with the four columns every archive technology carries —
-//! `data_type`, `identifier`, `bytes`, `metadata` — and `archived_at`, when
-//! it was handed over, in UTC. The table is the operator's to create; this
-//! is the shape it is written for:
+//! The store, the row, the SELECT and the receipt are the capability's
+//! (`archive::sql`, ADR-0044); only the dialect is this crate's — backtick
+//! identifiers, literals with the backslash escapes the server reads, the
+//! bytes going in as the `X'…'` hexadecimal literal a BLOB stores as the
+//! bytes and coming back spelled out — `CONCAT('0x', HEX(bytes))` —
+//! because the text protocol hands a BLOB over raw and the row reader
+//! would take it for text, `archived_at` as a `DATETIME` literal in UTC,
+//! and the new row's id asked for afterwards with [`LAST_INSERT_ID`] on
+//! the connection that inserted. The connection is the `MySQL` transport
+//! technology's — the text protocol with the native password. The table is
+//! the operator's to create; this is the shape it is written for:
 //!
 //! ```sql
 //! CREATE TABLE archive (
@@ -28,122 +27,65 @@
 //! );
 //! ```
 //!
-//! An archive never deletes (ADR-0040): this one inserts and selects, nothing
-//! else. The receipt is `mysql://<server>/<database>/<table>?id=<n>`, the
-//! id read with `SELECT LAST_INSERT_ID()` on the connection that inserted,
-//! and restoring reads the table and the id from the receipt on the store's
-//! own connection.
+//! The receipt is `mysql://<server>/<database>/<table>?id=<n>`.
 
-pub mod row;
+use std::time::SystemTime;
 
-use std::time::{Duration, SystemTime};
+use archive::ArchiveError;
+use archive::sql::{Dialect, Row, Server, first_cell};
+use mysql::{Client, Login, hex};
 
-use archive::{ArchiveError, ArchiveItem, ArchiveReceipt, ArchiveStore, location};
-use mysql::{Client, Login};
+/// The statement that asks for the id the last insert on this connection
+/// made, since the protocol's answer to the INSERT carries it and the
+/// transport's [`mysql::QueryResult`] does not.
+pub const LAST_INSERT_ID: &str = "SELECT LAST_INSERT_ID()";
 
-/// The table written to unless told otherwise.
-pub const DEFAULT_TABLE: &str = "archive";
+/// What `MySQL` does its own way.
+pub struct MySql;
 
-/// An archive that keeps items as rows of one table on one server.
-pub struct MysqlArchive {
-    server: String,
-    database: String,
-    user: String,
-    password: Option<String>,
-    table: String,
-    timeout: Option<Duration>,
-}
+impl Dialect for MySql {
+    const SCHEME: &'static str = "mysql";
+    const BYTES_EXPRESSION: &'static str = "CONCAT('0x', HEX(bytes))";
+    type Connection = Client;
 
-impl MysqlArchive {
-    /// An archive writing to [`DEFAULT_TABLE`] in `database` at `server`,
-    /// logging in as `user` with an empty password.
-    #[must_use]
-    pub fn new(
-        server: impl Into<String>,
-        database: impl Into<String>,
-        user: impl Into<String>,
-    ) -> Self {
-        Self {
-            server: server.into(),
-            database: database.into(),
-            user: user.into(),
-            password: None,
-            table: DEFAULT_TABLE.to_string(),
-            timeout: None,
-        }
+    fn quote_identifier(name: &str) -> String {
+        mysql::quote_identifier(name)
     }
 
-    /// The password the login scrambles.
-    #[must_use]
-    pub fn with_password(mut self, password: impl Into<String>) -> Self {
-        self.password = Some(password.into());
-        self
+    fn quote_literal(text: &str) -> String {
+        mysql::quote_literal(text)
     }
 
-    /// The table to write to, `audit.archive` say.
-    #[must_use]
-    pub fn with_table(mut self, table: impl Into<String>) -> Self {
-        self.table = table.into();
-        self
+    fn bytes_literal(bytes: &[u8]) -> String {
+        hex::hex_literal(bytes)
     }
 
-    /// Give up on a server that stops mid-packet.
-    #[must_use]
-    pub const fn timing_out_after(mut self, timeout: Duration) -> Self {
-        self.timeout = Some(timeout);
-        self
+    fn column_bytes(text: String) -> Vec<u8> {
+        hex::column_bytes(text)
     }
 
-    fn connect(&self) -> Result<Client, ArchiveError> {
-        let login = Login::new(&*self.user, self.password.clone().unwrap_or_default());
-        Client::connect(&self.server, &self.database, &login, self.timeout)
+    fn archived_at() -> String {
+        archive::timestamp::datetime_utc(SystemTime::now())
+    }
+
+    fn connect(server: &Server) -> Result<Client, ArchiveError> {
+        let login = Login::new(&*server.user, server.password.clone().unwrap_or_default());
+        Client::connect(&server.address, &server.database, &login, server.timeout)
             .map_err(ArchiveError::caused_by)
     }
 
-    fn location(&self, id: &str) -> String {
-        format!(
-            "mysql://{}/{}/{}?id={id}",
-            self.server, self.database, self.table
-        )
-    }
-}
-
-impl ArchiveStore for MysqlArchive {
-    fn archive(&self, item: ArchiveItem) -> Result<ArchiveReceipt, ArchiveError> {
-        let archived_at = archive::timestamp::datetime_utc(SystemTime::now());
-        let sql = row::insert_sql(&self.table, &item, &archived_at);
-        let mut client = self.connect()?;
-        client.execute(&sql).map_err(ArchiveError::caused_by)?;
-        let result = client
-            .query(row::LAST_INSERT_ID)
-            .map_err(ArchiveError::caused_by)?;
-        client.close().map_err(ArchiveError::caused_by)?;
-        let id = result
-            .rows
-            .first()
-            .and_then(|first| first.first())
-            .cloned()
-            .flatten()
-            .ok_or_else(|| ArchiveError {
-                message: format!("the insert into {} returned no id", self.table),
-            })?;
-        Ok(ArchiveReceipt {
-            location: self.location(&id),
-            checksum: None,
-        })
+    fn select(client: &mut Client, sql: &str) -> Result<Vec<Row>, ArchiveError> {
+        Ok(client.query(sql).map_err(ArchiveError::caused_by)?.rows)
     }
 
-    fn restore(&self, receipt: &ArchiveReceipt) -> Result<ArchiveItem, ArchiveError> {
-        let (table, id) = location::table_row("mysql", &receipt.location)?;
-        let mut client = self.connect()?;
-        let result = client
-            .query(&row::DIALECT.select_sql(table, id))
-            .map_err(ArchiveError::caused_by)?;
-        client.close().map_err(ArchiveError::caused_by)?;
-        let first = result.rows.first().ok_or_else(|| ArchiveError {
-            message: format!("no row at {}", receipt.location),
-        })?;
-        row::DIALECT.item_from_row(first, &receipt.location)
+    /// The INSERT answers a count, so the id is asked for after it.
+    fn insert(client: &mut Client, sql: &str) -> Result<Option<String>, ArchiveError> {
+        client.execute(sql).map_err(ArchiveError::caused_by)?;
+        Ok(first_cell(Self::select(client, LAST_INSERT_ID)?))
+    }
+
+    fn close(client: Client) -> Result<(), ArchiveError> {
+        client.close().map_err(ArchiveError::caused_by)
     }
 }
 
@@ -151,7 +93,8 @@ impl ArchiveStore for MysqlArchive {
 mod tests {
     use super::*;
     use archive::fixture::{item, secs};
-    use mysql::hex;
+    use archive::sql::{SqlArchive, insert_sql, item_from_row, select_sql};
+    use archive::{ArchiveItem, ArchiveReceipt, ArchiveStore, metadata};
     use mysql::{Answer, Event, Session};
     use std::net::TcpListener;
     use std::thread::JoinHandle;
@@ -172,7 +115,7 @@ mod tests {
             Some(held.data_type.clone()),
             Some(held.identifier.clone()),
             Some(hex::hex_literal(&held.bytes)),
-            Some(archive::metadata::encode(&held.metadata)),
+            Some(metadata::encode(&held.metadata)),
         ];
         let handle = std::thread::spawn(move || {
             let mut events = Vec::new();
@@ -192,7 +135,7 @@ mod tests {
                     .answering(|sql| {
                         if sql.starts_with("INSERT") {
                             Some(Answer::Complete(1))
-                        } else if sql == row::LAST_INSERT_ID {
+                        } else if sql == LAST_INSERT_ID {
                             Some(Answer::Rows {
                                 columns: vec!["LAST_INSERT_ID()".to_string()],
                                 rows: vec![vec![Some("41".to_string())]],
@@ -210,11 +153,57 @@ mod tests {
         (address, handle)
     }
 
+    fn quoted() -> ArchiveItem {
+        ArchiveItem {
+            data_type: "json".to_string(),
+            identifier: "it's #1".to_string(),
+            bytes: vec![0x7b, 0xff],
+            metadata: vec![("source".to_string(), "playground".to_string())],
+        }
+    }
+
+    #[test]
+    fn the_insert_names_the_five_columns_and_the_select_spells_the_bytes() {
+        let sql = insert_sql::<MySql>("audit.archive", &quoted(), "2026-09-09 12:00:00");
+        assert!(sql.starts_with(
+            "INSERT INTO `audit`.`archive` \
+             (data_type, identifier, bytes, metadata, archived_at) VALUES ('json', 'it\\'s #1', \
+             X'7bff', "
+        ));
+        assert!(sql.ends_with("'2026-09-09 12:00:00')"), "{sql}");
+        assert_eq!(
+            select_sql::<MySql>("Archive", 41),
+            "SELECT data_type, identifier, CONCAT('0x', HEX(bytes)), metadata \
+             FROM `Archive` WHERE id = 41"
+        );
+    }
+
+    #[test]
+    fn a_row_in_either_bytes_form_is_the_item_again() {
+        let original = quoted();
+        let hex = vec![
+            Some("json".to_string()),
+            Some("it's #1".to_string()),
+            Some("0x7BFF".to_string()),
+            Some(metadata::encode(&original.metadata)),
+        ];
+        assert_eq!(item_from_row::<MySql>(&hex, "here").expect("row"), original);
+        let text = vec![
+            Some("json".to_string()),
+            Some("it's #1".to_string()),
+            Some("plain".to_string()),
+            Some(String::new()),
+        ];
+        let restored = item_from_row::<MySql>(&text, "here").expect("row");
+        assert_eq!(restored.bytes, b"plain");
+        assert!(restored.metadata.is_empty());
+    }
+
     #[test]
     fn an_archived_item_is_one_insert_and_its_receipt_names_the_row() {
         let original = item("json#1");
         let (address, far_end) = far_end("secret", &original, 1);
-        let store = MysqlArchive::new(address.clone(), "orders", "xmip")
+        let store = SqlArchive::<MySql>::new(address.clone(), "orders", "xmip")
             .with_password("secret")
             .with_table("audit.archive")
             .timing_out_after(secs(2));
@@ -235,14 +224,14 @@ mod tests {
         let stamp = &sql[sql.len() - 22..];
         assert!(stamp.starts_with("'20") && stamp.ends_with("')"), "{sql}");
         assert_eq!(&stamp[11..12], " ", "a DATETIME literal, not RFC 3339");
-        assert_eq!(events[1], Event::Executed(row::LAST_INSERT_ID.to_string()));
+        assert_eq!(events[1], Event::Executed(LAST_INSERT_ID.to_string()));
     }
 
     #[test]
     fn the_row_restores_the_item_over_a_second_connection() {
         let original = item("json#2");
         let (address, far_end) = far_end("", &original, 2);
-        let store = MysqlArchive::new(address, "orders", "xmip").timing_out_after(secs(2));
+        let store = SqlArchive::<MySql>::new(address, "orders", "xmip").timing_out_after(secs(2));
         let receipt = store.archive(original.clone()).expect("archive");
         let restored = store.restore(&receipt).expect("restore");
         assert_eq!(restored, original, "the row read back is the item");
@@ -261,7 +250,7 @@ mod tests {
     #[test]
     fn a_wrong_password_and_a_wrong_receipt_are_refused() {
         let (address, far_end) = far_end("secret", &item("json#3"), 1);
-        let store = MysqlArchive::new(address, "orders", "xmip")
+        let store = SqlArchive::<MySql>::new(address, "orders", "xmip")
             .with_password("wrong")
             .timing_out_after(secs(2));
         let refused = store.archive(item("json#3")).expect_err("wrong password");
