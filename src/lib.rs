@@ -49,7 +49,7 @@ impl Dialect for MySql {
     type Connection = Client;
 
     fn quote_identifier(name: &str) -> String {
-        mysql::quote_identifier(name)
+        mysql::insert::DIALECT.quote_identifier(name)
     }
 
     fn quote_literal(text: &str) -> String {
