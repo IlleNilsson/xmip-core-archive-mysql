@@ -33,7 +33,8 @@ use std::time::SystemTime;
 
 use archive::ArchiveError;
 use archive::sql::{Dialect, Row, Server, first_cell};
-use mysql::{Client, Login, hex};
+use mysql::{Client, hex};
+use transport::Login;
 
 /// The statement that asks for the id the last insert on this connection
 /// made, since the protocol's answer to the INSERT carries it and the

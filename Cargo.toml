@@ -21,6 +21,9 @@ archive = { package = "xmip-core-archive", git = "https://github.com/IlleNilsson
 # text protocol with the native password, and its Session is the far end
 # a test binds.
 mysql = { package = "xmip-core-transport-mysql", git = "https://github.com/IlleNilsson/xmip-core-transport-mysql", branch = "main" }
+# The user and password it logs in with: the transport capability's one
+# `Login`.
+transport = { package = "xmip-core-transport", git = "https://github.com/IlleNilsson/xmip-core-transport", branch = "main" }
 
 [dev-dependencies]
 # The tests archive the capability's fixture item (ADR-0044); the feature
